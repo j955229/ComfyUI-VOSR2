@@ -272,13 +272,30 @@ memory; the Qwen VAE always runs in fp32.
 
 ## Status
 
-In-progress v1. Done: model discovery/validation, first-run auto-download from
+In-progress v1.
+
+**Implemented:** model discovery/validation, first-run auto-download from
 `CSWRY/VOSR`, vendored DiT/VAE/DINOv2 architectures, ComfyUI-managed load/offload
 via `ModelPatcher`, untiled and tiled (DiT + VAE) inference, per-item seeded
 batching, torch-native `wavelet` / `adain` / `none` color alignment, and a
-drag-and-drop example workflow. Not yet done: numeric validation against the
-upstream reference, measured VRAM/tile presets, and a confirmed RunComfy /
-ComfyUI-Manager install path.
+drag-and-drop example workflow.
+
+**Install paths:** listed on the
+[Comfy Registry](https://registry.comfy.org/nodes/comfyui-vosr2) and installable
+on RunComfy via its Custom Nodes Manager — see [Installation](#installation).
+Note: the registry's automated scan currently **flags every release since
+`0.2.0`** (the first-run remote download), so ComfyUI-Manager / `comfy node
+install` still serve `0.1.0`. Use `git clone` for the current version until the
+flag is cleared.
+
+**Verified in CI** ([comfy-test](https://github.com/PozzettiAndrea/comfy-test),
+Linux/CPU, Python 3.10, PyTorch 2.10, ComfyUI 0.35.0): the package installs
+against a fresh ComfyUI, imports without error, and both nodes register with
+valid schemas. The model load + inference path is **not** exercised in CI — it
+needs a GPU.
+
+**Not yet done:** numeric validation against the upstream reference, measured
+VRAM/tile presets, GPU execution in CI, and the macOS / Windows CI matrix.
 
 ## Licensing
 

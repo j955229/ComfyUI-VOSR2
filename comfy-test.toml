@@ -1,20 +1,30 @@
-# comfy-test config -- https://github.com/PozzettiAndrea/comfy-test (workflow pinned @v0.4.5)
+# comfy-test config -- https://github.com/PozzettiAndrea/comfy-test
 #
-# For now this is an install / import / registration smoke test across CPU OSes.
-# "execution" is intentionally omitted: VOSR 2.0 is a one-step 1.4B model that
-# needs a GPU -- a full run downloads ~7 GB of weights and then OOMs or times
-# out on CPU CI runners. Add GPU platforms + "execution" (plus a workflows/
-# folder and a [test.workflows] section) once self-hosted CUDA runners are
-# available.
+# Two intents:
+#   * CPU lanes (CI, GitHub-hosted): syntax + install + registration only -- the
+#     cheap cross-platform "does it still install and register" canary. No
+#     execution: VOSR 2.0 is a 1.4B GPU model.
+#   * CUDA lanes (local, or a self-hosted GPU runner): the same three, plus one
+#     real end-to-end run of workflows/minimal_vosr_test.json to confirm the
+#     model downloads, loads onto the GPU, and produces an image.
+#
+# "instantiation" is deliberately absent: comfy-test imports the package in a
+# bare subprocess with no ComfyUI --cpu context, and loader.py's module-scope
+# `import comfy.model_management` runs device detection that raises under
+# torch 2.10 on a CPU-only box. The execution level runs against a live server,
+# so it is unaffected. Fix = make the comfy.* imports in loader.py lazy, then
+# re-add "instantiation".
 
 [test]
-# "instantiation" is dropped for now: comfy-test 0.4.15 imports the package in a
-# bare subprocess (no ComfyUI --cpu context), and loader.py's module-scope
-# `import comfy.model_management` runs device detection that raises under
-# torch 2.10 on a CPU-only box. REGISTRATION already validates a clean import +
-# node registration in a real ComfyUI. Re-add once the eager comfy.* imports are
-# made lazy (or the harness sets CPU mode for that subprocess).
-levels = ["syntax", "install", "registration"]
+levels = ["syntax", "install", "registration", "execution"]
 
 [test.platforms]
-platforms = ["linux-cpu", "macos-cpu", "windows-cpu", "windows-portable-cpu"]
+platforms = [
+    "linux-cpu", "windows-cpu", "windows-portable-cpu", "macos-cpu",
+    "linux-cuda", "windows-cuda",
+]
+
+[test.workflows]
+# CPU lanes run nothing (no `cpu` key). CUDA lanes run just this one workflow.
+cuda = ["minimal_vosr_test.json"]
+timeout = 3600   # first execute downloads ~7 GB from CSWRY/VOSR into a fresh workspace

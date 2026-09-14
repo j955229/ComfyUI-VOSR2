@@ -17,13 +17,15 @@ nothing here touches the network. See ``ensure_vosr2_files``.
 The ``model`` combo value is re-joined against ``_VOSR2_ROOT`` via
 ``_safe_child_dir``, never taken as -- or resolved through -- an arbitrary path.
 """
+import gc
 import json
 import logging
 import re
 from pathlib import Path
 
 import torch
-from safetensors.torch import load_file, save_file
+from safetensors import safe_open
+from safetensors.torch import save_file
 
 import comfy.model_management
 import comfy.model_patcher
@@ -61,7 +63,8 @@ _VISION_FILENAME = "dinov2_vitl14.safetensors"  # converted DINOv2-L, inside the
 _DIT_HF_FILES = ("VOSR2/args.json", "VOSR2/checkpoints/ema_model.safetensors")
 _VAE_HF_FILES = tuple(f"{_VAE_SUBDIR}/{name}" for name in _VAE_FILES)
 # DINOv2-L ships upstream as a raw torch pickle; the loader converts it to
-# safetensors on download (this package only ever ``load_file``s .safetensors).
+# safetensors on download (this package only ever reads .safetensors for model
+# weights, streaming via ``safe_open`` -- see ``_load_state_dict_lean``).
 _DINOV2_HF_FILE = "torch_cache/checkpoints/dinov2_vitl14_pretrain.pth"
 
 # Required args.json values for a VOSR 2.0 (one-step 1.4B) checkpoint. See
@@ -239,28 +242,59 @@ def _resolve_dit_weight_path(bundle_dir: Path) -> Path:
     return weight
 
 
-def _clean_state_dict_keys(state_dict: dict) -> dict:
-    cleaned = {}
-    for key, value in state_dict.items():
-        stripped = key
-        for prefix in _STRIPPABLE_PREFIXES:
-            if stripped.startswith(prefix):
-                stripped = stripped[len(prefix):]
-                break
-        if any(pattern.match(stripped) for pattern in _TRAINING_ONLY_KEY_PATTERNS):
-            continue
-        cleaned[stripped] = value
-    return cleaned
+def _strip_key(key: str) -> str | None:
+    """Apply the prefix-stripping / drop rules to one checkpoint key.
+
+    Returns the cleaned key, or ``None`` if this key should be dropped (a known
+    training-only artifact with no corresponding module, e.g. an EMA wrapper's
+    step counter).
+    """
+    stripped = key
+    for prefix in _STRIPPABLE_PREFIXES:
+        if stripped.startswith(prefix):
+            stripped = stripped[len(prefix):]
+            break
+    if any(pattern.match(stripped) for pattern in _TRAINING_ONLY_KEY_PATTERNS):
+        return None
+    return stripped
 
 
-def _strict_load(module: torch.nn.Module, state_dict: dict, source: Path):
-    state_dict = _clean_state_dict_keys(state_dict)
-    missing, unexpected = module.load_state_dict(state_dict, strict=False)
+def _load_state_dict_lean(module: torch.nn.Module, path: Path, dtype: torch.dtype, source: Path) -> None:
+    """Stream a safetensors checkpoint into `module`, then assign it in one shot.
+
+    This *must* go through ``nn.Module.load_state_dict`` rather than a manual
+    ``setattr`` per key: ComfyUI's ``comfy.ops`` layers (every ``ops.Linear``
+    in LightningDiT) support aimdo's lazy-init mode, where ``.weight``/``.bias``
+    are plain ``None`` at construction -- deliberately never allocated -- and
+    only become real ``nn.Parameter``s inside each layer's own overridden
+    ``_load_from_state_dict``, which ``load_state_dict`` calls per submodule.
+    A hand-rolled traversal bypasses that hook and never sees those names (an
+    earlier version of this function did exactly that and silently "lost"
+    every ops.Linear weight). ``assign=True`` tells that hook (via
+    ``local_metadata["assign_to_params_buffers"]``) to take the loaded tensor
+    directly instead of cloning it, and reading + casting one tensor at a time
+    off the safetensors mmap (rather than eager ``load_file()``) means the
+    checkpoint is never resident a second time in its original dtype. Since
+    aimdo-lazy layers hold no real memory before this call, peak RAM is
+    roughly the model at its final dtype, not the model plus a full extra
+    copy of the checkpoint.
+    """
+    sd: dict[str, torch.Tensor] = {}
+    with safe_open(str(path), framework="pt", device="cpu") as f:
+        for key in f.keys():
+            stripped = _strip_key(key)
+            if stripped is None:
+                continue
+            sd[stripped] = f.get_tensor(key).to(dtype)
+
+    missing, unexpected = module.load_state_dict(sd, strict=False, assign=True)
     if missing or unexpected:
         raise VOSR2LoadError(
             f"VOSR2 checkpoint at {source} does not match the expected {type(module).__name__} "
             f"architecture (missing={missing}, unexpected={unexpected})."
         )
+    del sd
+    gc.collect()
 
 
 def _resolve_dtype(dtype: str, device) -> torch.dtype:
@@ -371,42 +405,55 @@ def load_vosr2(model_name: str, dtype: str) -> VOSR2Model:
     offload_device = comfy.model_management.unet_offload_device()
     compute_dtype = _resolve_dtype(dtype, load_device)
 
-    base_channels = 16  # Qwen 2D VAE latent channels
-    dit = LightningDiT(
-        input_size=args["resolution"] // 8,
-        patch_size=args["patch_size"],
-        in_channels=2 * base_channels,
-        out_channels=base_channels,
-        hidden_size=args["dim"],
-        depth=args["depth"],
-        num_heads=args["num_heads"],
-        mlp_ratio=args["mlp_ratio"],
-        z_dims=args["enc_dim"],
-        encdim_ratio=args["encdim_ratio"],
-        auxiliary_time_cond=args["auxiliary_time_cond"],
-        use_qknorm=args["use_qknorm"],
-        use_swiglu=args["use_swiglu"],
-        use_rope=args["use_rope"],
-        use_rmsnorm=args["use_rmsnorm"],
-        num_fused_layers=len(args["layer_dinov2b_list"]),
-    )
-    dit_state_dict = load_file(str(dit_weight_path))
-    _strict_load(dit, dit_state_dict, dit_weight_path)
-    dit = dit.eval().to(compute_dtype)
-    for p in dit.parameters():
-        p.requires_grad_(False)
+    # Node execute() methods run under ComfyUI's torch.inference_mode(), and
+    # constructing a module there is unsafe for us: comfy.ops layers (every
+    # ops.Linear in LightningDiT) built while inference_mode is active don't
+    # register as ordinary nn.Parameters, so named_parameters()/
+    # load_state_dict() silently sees only a fraction of the model (here,
+    # just the plain-nn.Parameter RMSNorm weights -- 257 of 849 tensors) and
+    # every ops.Linear weight/bias comes back "unexpected". Construction and
+    # checkpoint loading need real, autograd-trackable parameters regardless
+    # of the caller's inference_mode state, so do both inside an explicit
+    # inference_mode(False) scope; only the ModelPatcher hand-off below (which
+    # ComfyUI expects to happen under inference_mode) stays outside it.
+    with torch.inference_mode(False):
+        base_channels = 16  # Qwen 2D VAE latent channels
+        dit = LightningDiT(
+            input_size=args["resolution"] // 8,
+            patch_size=args["patch_size"],
+            in_channels=2 * base_channels,
+            out_channels=base_channels,
+            hidden_size=args["dim"],
+            depth=args["depth"],
+            num_heads=args["num_heads"],
+            mlp_ratio=args["mlp_ratio"],
+            z_dims=args["enc_dim"],
+            encdim_ratio=args["encdim_ratio"],
+            auxiliary_time_cond=args["auxiliary_time_cond"],
+            use_qknorm=args["use_qknorm"],
+            use_swiglu=args["use_swiglu"],
+            use_rope=args["use_rope"],
+            use_rmsnorm=args["use_rmsnorm"],
+            num_fused_layers=len(args["layer_dinov2b_list"]),
+        )
+        _load_state_dict_lean(dit, dit_weight_path, compute_dtype, dit_weight_path)
+        # .to() is a no-op for tensors already at compute_dtype (everything the
+        # checkpoint covered); this only touches whatever _load_state_dict_lean
+        # didn't -- e.g. non-persistent buffers absent from the checkpoint.
+        dit = dit.eval().to(compute_dtype)
+        for p in dit.parameters():
+            p.requires_grad_(False)
 
-    vae = AutoencoderKLQwenImage2D.from_pretrained(str(vae_dir))
-    vae = vae.eval().float()  # Qwen VAE runs in fp32; see VOSR2.md "Device, dtype, and memory".
-    for p in vae.parameters():
-        p.requires_grad_(False)
+        vae = AutoencoderKLQwenImage2D.from_pretrained(str(vae_dir))
+        vae = vae.eval().float()  # Qwen VAE runs in fp32; see VOSR2.md "Device, dtype, and memory".
+        for p in vae.parameters():
+            p.requires_grad_(False)
 
-    vision_encoder = build_dinov2_vitl14()
-    vision_state_dict = load_file(str(vision_path))
-    _strict_load(vision_encoder, vision_state_dict, vision_path)
-    vision_encoder = vision_encoder.eval().to(compute_dtype)
-    for p in vision_encoder.parameters():
-        p.requires_grad_(False)
+        vision_encoder = build_dinov2_vitl14()
+        _load_state_dict_lean(vision_encoder, vision_path, compute_dtype, vision_path)
+        vision_encoder = vision_encoder.eval().to(compute_dtype)
+        for p in vision_encoder.parameters():
+            p.requires_grad_(False)
 
     dit_patcher = comfy.model_patcher.ModelPatcher(dit, load_device=load_device, offload_device=offload_device)
     vae_patcher = comfy.model_patcher.ModelPatcher(vae, load_device=load_device, offload_device=offload_device)
