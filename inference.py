@@ -159,8 +159,19 @@ def run_vosr2(
     vae_tile_size: int,
     vae_tile_overlap: int,
 ) -> torch.Tensor:
-    if images_bhwc01.shape[-1] != 3:
-        raise ValueError(f"VOSR2Upscale expects a 3-channel RGB IMAGE, got {images_bhwc01.shape[-1]} channels.")
+    channels = images_bhwc01.shape[-1]
+    if channels not in (3, 4):
+        raise ValueError(
+            f"VOSR2Upscale expects a 3-channel RGB or 4-channel RGBA IMAGE, got {channels} channels."
+        )
+
+    # VOSR2 itself is an RGB model. Preserve RGBA inputs by keeping alpha out of
+    # the VOSR2 path, then resize and reattach it after RGB super-resolution.
+    alpha_bhwc01 = None
+    if channels == 4:
+        alpha_bhwc01 = images_bhwc01[..., 3:4]
+        images_bhwc01 = images_bhwc01[..., :3]
+
     if tile_size > 0 and tile_overlap >= tile_size:
         raise ValueError(f"VOSR2Upscale: tile_overlap ({tile_overlap}) must be smaller than tile_size ({tile_size}).")
     if vae_tile_size > 0 and vae_tile_overlap >= vae_tile_size:
@@ -215,4 +226,18 @@ def run_vosr2(
         decoded01 = (outputs_pm1.clamp(-1.0, 1.0) + 1.0) / 2.0
         aligned01 = apply_color_alignment(decoded01, resized01, color_alignment)
 
-    return aligned01.movedim(1, -1)
+    output_bhwc01 = aligned01.movedim(1, -1)
+    if alpha_bhwc01 is not None:
+        alpha_bchw01 = alpha_bhwc01.movedim(-1, 1).to(
+            device=aligned01.device,
+            dtype=aligned01.dtype,
+        )
+        alpha_bchw01 = F.interpolate(
+            alpha_bchw01,
+            size=aligned01.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        ).clamp(0.0, 1.0)
+        output_bhwc01 = torch.cat([output_bhwc01, alpha_bchw01.movedim(1, -1)], dim=-1)
+
+    return output_bhwc01
