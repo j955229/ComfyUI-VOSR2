@@ -52,7 +52,7 @@ One-step super-resolution on an `IMAGE` batch.
 | Input | Default | Range | Notes |
 |---|---:|---|---|
 | `model` | — | `VOSR2_MODEL` | From the loader |
-| `image` | — | `IMAGE` | Single image or batch |
+| `image` | — | `IMAGE` | RGB or RGBA image/batch. RGBA alpha is preserved, resized separately, and reattached after VOSR2 processes RGB. |
 | `upscale` | `4` | ≥ 1, uncapped | Exact output multiplier |
 | `seed` | `42` | ≥ 0 | Latent-noise seed; batch item *i* uses `seed + i` |
 | `color_alignment` | `wavelet` | `wavelet` / `adain` / `none` | Post-process against the bicubic target |
